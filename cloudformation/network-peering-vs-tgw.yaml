@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Networking Lab - VPC Peering vs Transit Gateway.
+  Creates 3 VPCs with EC2 instances, full-mesh peering (optional), and a Transit Gateway (optional).
+  Compare point-to-point peering vs hub-and-spoke TGW.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair name for SSH
+  YourIpCidr:
+    Type: String
+    Description: Your IP in CIDR form for SSH to instances (e.g., 203.0.113.10/32)
+    Default: 0.0.0.0/0
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro]
+  EnablePeering:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+    Description: Create VPC peering connections (A-B, B-C, A-C) and routes
+  EnableTGW:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+    Description: Create Transit Gateway, VPC attachments, and TGW routing
+
+Mappings: {}
+
+Conditions:
+  DoPeering: !Equals [!Ref EnablePeering, "true"]
+  DoTGW: !Equals [!Ref EnableTGW, "true"]
+
+Resources:
+  AmiAL2023:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  # ---------------- VPC A ----------------
+  VpcA:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab2-vpc-a }]
+  IgwA:
+    Type: AWS::EC2::InternetGateway
+  AttachIgwA:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcA
+      InternetGatewayId: !Ref IgwA
+  SubnetAPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcA
+      CidrBlock: 10.10.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab2-a-public }]
+  RtAPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcA }
+  RTAssoAPub:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetAPublic, RouteTableId: !Ref RtAPublic }
+  RtAPubDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtAPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IgwA
+  SgAPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public SG - HTTP from world, SSH from your IP, ICMP within lab
+      VpcId: !Ref VpcA
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8 }
+  Ec2APublic:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetAPublic
+      SecurityGroupIds: [ !Ref SgAPublic ]
+      Tags: [{ Key: Name, Value: EC2-A }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd iputils traceroute tcpdump
+          echo "<h1>EC2-A (10.10.1.0/24)</h1>" > /var/www/html/index.html
+          systemctl enable --now httpd
+
+  # ---------------- VPC B ----------------
+  VpcB:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab2-vpc-b }]
+  IgwB:
+    Type: AWS::EC2::InternetGateway
+  AttachIgwB:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcB
+      InternetGatewayId: !Ref IgwB
+  SubnetBPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcB
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab2-b-public }]
+  RtBPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcB }
+  RTAssoBPub:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetBPublic, RouteTableId: !Ref RtBPublic }
+  RtBPubDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtBPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IgwB
+  SgBPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public SG - HTTP from world, SSH from your IP, ICMP within lab
+      VpcId: !Ref VpcB
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8 }
+  Ec2BPublic:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetBPublic
+      SecurityGroupIds: [ !Ref SgBPublic ]
+      Tags: [{ Key: Name, Value: EC2-B }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd iputils traceroute tcpdump
+          echo "<h1>EC2-B (10.20.1.0/24)</h1>" > /var/www/html/index.html
+          systemctl enable --now httpd
+
+  # ---------------- VPC C ----------------
+  VpcC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab2-vpc-c }]
+  IgwC:
+    Type: AWS::EC2::InternetGateway
+  AttachIgwC:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcC
+      InternetGatewayId: !Ref IgwC
+  SubnetCPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcC
+      CidrBlock: 10.30.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab2-c-public }]
+  RtCPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcC }
+  RTAssoCPub:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetCPublic, RouteTableId: !Ref RtCPublic }
+  RtCPubDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtCPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IgwC
+  SgCPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public SG - HTTP from world, SSH from your IP, ICMP within lab
+      VpcId: !Ref VpcC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8 }
+  Ec2CPublic:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetCPublic
+      SecurityGroupIds: [ !Ref SgCPublic ]
+      Tags: [{ Key: Name, Value: EC2-C }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd iputils traceroute tcpdump
+          echo "<h1>EC2-C (10.30.1.0/24)</h1>" > /var/www/html/index.html
+          systemctl enable --now httpd
+
+  # ------------- VPC Peering (full mesh) -------------
+  PeerAB:
+    Type: AWS::EC2::VPCPeeringConnection
+    Condition: DoPeering
+    Properties:
+      VpcId: !Ref VpcA
+      PeerVpcId: !Ref VpcB
+      Tags: [{ Key: Name, Value: lab2-peer-a-b }]
+  PeerBC:
+    Type: AWS::EC2::VPCPeeringConnection
+    Condition: DoPeering
+    Properties:
+      VpcId: !Ref VpcB
+      PeerVpcId: !Ref VpcC
+      Tags: [{ Key: Name, Value: lab2-peer-b-c }]
+  PeerAC:
+    Type: AWS::EC2::VPCPeeringConnection
+    Condition: DoPeering
+    Properties:
+      VpcId: !Ref VpcA
+      PeerVpcId: !Ref VpcC
+      Tags: [{ Key: Name, Value: lab2-peer-a-c }]
+
+  # Routes for peering
+  RtAtoBPeer:
+    Type: AWS::EC2::Route
+    Condition: DoPeering
+    Properties:
+      RouteTableId: !Ref RtAPublic
+      DestinationCidrBlock: 10.20.0.0/16
+      VpcPeeringConnectionId: !Ref PeerAB
+  RtAtoCPeer:
+    Type: AWS::EC2::Route
+    Condition: DoPeering
+    Properties:
+      RouteTableId: !Ref RtAPublic
+      DestinationCidrBlock: 10.30.0.0/16
+      VpcPeeringConnectionId: !Ref PeerAC
+
+  RtBtoAPeer:
+    Type: AWS::EC2::Route
+    Condition: DoPeering
+    Properties:
+      RouteTableId: !Ref RtBPublic
+      DestinationCidrBlock: 10.10.0.0/16
+      VpcPeeringConnectionId: !Ref PeerAB
+  RtBtoCPeer:
+    Type: AWS::EC2::Route
+    Condition: DoPeering
+    Properties:
+      RouteTableId: !Ref RtBPublic
+      DestinationCidrBlock: 10.30.0.0/16
+      VpcPeeringConnectionId: !Ref PeerBC
+
+  RtCtoAPeer:
+    Type: AWS::EC2::Route
+    Condition: DoPeering
+    Properties:
+      RouteTableId: !Ref RtCPublic
+      DestinationCidrBlock: 10.10.0.0/16
+      VpcPeeringConnectionId: !Ref PeerAC
+  RtCtoBPeer:
+    Type: AWS::EC2::Route
+    Condition: DoPeering
+    Properties:
+      RouteTableId: !Ref RtCPublic
+      DestinationCidrBlock: 10.20.0.0/16
+      VpcPeeringConnectionId: !Ref PeerBC
+
+  # ------------- Transit Gateway ---------------------
+  TGW:
+    Type: AWS::EC2::TransitGateway
+    Condition: DoTGW
+    Properties:
+      Description: lab2 tgw
+      DefaultRouteTableAssociation: enable
+      DefaultRouteTablePropagation: enable
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      Tags: [{ Key: Name, Value: lab2-tgw }]
+
+  TGWAttachA:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Condition: DoTGW
+    Properties:
+      TransitGatewayId: !Ref TGW
+      VpcId: !Ref VpcA
+      SubnetIds: [ !Ref SubnetAPublic ]
+      Tags: [{ Key: Name, Value: lab2-tgw-attach-a }]
+  TGWAttachB:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Condition: DoTGW
+    Properties:
+      TransitGatewayId: !Ref TGW
+      VpcId: !Ref VpcB
+      SubnetIds: [ !Ref SubnetBPublic ]
+      Tags: [{ Key: Name, Value: lab2-tgw-attach-b }]
+  TGWAttachC:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Condition: DoTGW
+    Properties:
+      TransitGatewayId: !Ref TGW
+      VpcId: !Ref VpcC
+      SubnetIds: [ !Ref SubnetCPublic ]
+      Tags: [{ Key: Name, Value: lab2-tgw-attach-c }]
+
+  # VPC routes to other VPCs via TGW (static in VPC RTs)
+  RtAtoBTGW:
+    Type: AWS::EC2::Route
+    Condition: DoTGW
+    Properties:
+      RouteTableId: !Ref RtAPublic
+      DestinationCidrBlock: 10.20.0.0/16
+      TransitGatewayId: !Ref TGW
+  RtAtoCTGW:
+    Type: AWS::EC2::Route
+    Condition: DoTGW
+    Properties:
+      RouteTableId: !Ref RtAPublic
+      DestinationCidrBlock: 10.30.0.0/16
+      TransitGatewayId: !Ref TGW
+
+  RtBtoATGW:
+    Type: AWS::EC2::Route
+    Condition: DoTGW
+    Properties:
+      RouteTableId: !Ref RtBPublic
+      DestinationCidrBlock: 10.10.0.0/16
+      TransitGatewayId: !Ref TGW
+  RtBtoCTGW:
+    Type: AWS::EC2::Route
+    Condition: DoTGW
+    Properties:
+      RouteTableId: !Ref RtBPublic
+      DestinationCidrBlock: 10.30.0.0/16
+      TransitGatewayId: !Ref TGW
+
+  RtCtoATGW:
+    Type: AWS::EC2::Route
+    Condition: DoTGW
+    Properties:
+      RouteTableId: !Ref RtCPublic
+      DestinationCidrBlock: 10.10.0.0/16
+      TransitGatewayId: !Ref TGW
+  RtCtoBTGW:
+    Type: AWS::EC2::Route
+    Condition: DoTGW
+    Properties:
+      RouteTableId: !Ref RtCPublic
+      DestinationCidrBlock: 10.20.0.0/16
+      TransitGatewayId: !Ref TGW
+
+Outputs:
+  APublicIP:
+    Value: !GetAtt Ec2APublic.PublicIp
+    Description: Public IP of EC2 in VPC A
+  BPublicIP:
+    Value: !GetAtt Ec2BPublic.PublicIp
+    Description: Public IP of EC2 in VPC B
+  CPublicIP:
+    Value: !GetAtt Ec2CPublic.PublicIp
+    Description: Public IP of EC2 in VPC C
